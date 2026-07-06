@@ -57,7 +57,7 @@ jobs:
 
             # Allow curl to fail without killing the whole job
             set +e
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            HTTP_CODE=$(curl -v -H "apikey: $KEY" "$HEALTH_URL" 2>&1" \
               -H "apikey: $KEY" \
               "$HEALTH_URL")
             CURL_EXIT=$?
