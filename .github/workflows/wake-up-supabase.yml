@@ -29,6 +29,9 @@ jobs:
           LENGTH=$(echo "$SUPABASE_PROJECTS_JSON" | jq '. | length')
           echo "📦 Found $LENGTH Supabase project(s)."
 
+          echo "Raw URL: '$URL'"
+          nslookup "$(echo "$URL" | sed -E 's#https?://##' | cut -d/ -f1)" || true
+
           if [ "$LENGTH" -eq 0 ]; then
             echo "⚠️ No projects defined in SUPABASE_PROJECTS_JSON."
             exit 0
