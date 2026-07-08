@@ -2,38 +2,35 @@ name: Wake Up Supabase
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # Runs once per day at 06:00 UTC
-  workflow_dispatch:       # Allows manual runs from the Actions tab
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 jobs:
   ping-projects:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Validate SUPABASE_PROJECTS_JSON secret exists
+      - name: Проверить, что секрет SUPABASE_PROJECTS_JSON существует
         run: |
           if [ -z "${{ secrets.SUPABASE_PROJECTS_JSON }}" ]; then
-            echo "❌ Secret SUPABASE_PROJECTS_JSON is not set."
-            echo "Go to Settings → Secrets and variables → Actions and add it."
+            echo "❌ Секрет SUPABASE_PROJECTS_JSON не задан."
+            echo "Перейди в Settings → Secrets and variables → Actions и добавь его."
             exit 1
           fi
 
-      - name: Ping Supabase projects to keep them awake
+      - name: Разбудить проекты Supabase
         env:
           SUPABASE_PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
         run: |
-          # Install jq for JSON parsing
+          # Установим jq для парсинга JSON
           sudo apt-get update -y > /dev/null
           sudo apt-get install -y jq > /dev/null
 
           LENGTH=$(echo "$SUPABASE_PROJECTS_JSON" | jq '. | length')
-          echo "📦 Found $LENGTH Supabase project(s)."
-
-          echo "Raw URL: '$URL'"
-          nslookup "$(echo "$URL" | sed -E 's#https?://##' | cut -d/ -f1)" || true
+          echo "📦 Найдено проектов: $LENGTH"
 
           if [ "$LENGTH" -eq 0 ]; then
-            echo "⚠️ No projects defined in SUPABASE_PROJECTS_JSON."
+            echo "⚠️ В SUPABASE_PROJECTS_JSON нет проектов."
             exit 0
           fi
 
@@ -42,35 +39,49 @@ jobs:
             KEY=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].anon_key")
 
             if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              echo "⚠️ Skipping project at index $i — missing url."
+              echo "⚠️ Пропускаю проект $i — нет url."
               continue
             fi
 
             if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
-              echo "⚠️ Skipping $URL — missing anon_key."
+              echo "⚠️ Пропускаю $URL — нет anon_key."
               continue
             fi
 
-            # Auth health endpoint – always exists and is safe to call with anon key
-            HEALTH_URL="${URL%/}/auth/v1/health"
-            echo "🌐 Pinging AUTH via: $HEALTH_URL"
+            echo "=================================="
+            echo "🚀 Проект: $URL"
 
-            # Allow curl to fail without killing the whole job
+            # 1. Health-эндпоинт (auth/v1/health) – показывает, жив ли проект
+            HEALTH_URL="${URL%/}/auth/v1/health"
+            echo "🌐 Пингую health: $HEALTH_URL"
+
             set +e
-            HTTP_CODE=$(curl -v -H "apikey: $KEY" "$HEALTH_URL" 2>&1" \
-              -H "apikey: $KEY" \
-              "$HEALTH_URL")
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: $KEY" "$HEALTH_URL")
             CURL_EXIT=$?
             set -e
 
             if [ "$CURL_EXIT" -ne 0 ]; then
-              echo "❌ Curl failed for $URL (exit code $CURL_EXIT). Skipping."
-              continue
+              echo "❌ Curl упал с кодом $CURL_EXIT"
+            elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "✅ Health OK (HTTP $HTTP_CODE)"
+            else
+              echo "❌ Health ответил не 2xx (HTTP $HTTP_CODE), но проект, скорее всего, разбужен."
             fi
 
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "✅ $URL responded with HTTP $HTTP_CODE — project is reachable."
+            # 2. REST-эндпоинт (/rest/v1/) – дополнительный пинок для пробуждения БД
+            REST_URL="${URL%/}/rest/v1/"
+            echo "🌐 Пингую REST: $REST_URL"
+
+            set +e
+            HTTP_CODE_REST=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: $KEY" "$REST_URL")
+            CURL_EXIT_REST=$?
+            set -e
+
+            if [ "$CURL_EXIT_REST" -ne 0 ]; then
+              echo "❌ REST curl упал с кодом $CURL_EXIT_REST"
             else
-              echo "❌ $URL responded with HTTP $HTTP_CODE — check project status or URL."
+              echo "ℹ️ REST ответил HTTP $HTTP_CODE_REST (для пробуждения неважно)"
             fi
+
+            echo "=================================="
           done
