@@ -1,87 +1,116 @@
-name: Wake Up Supabase
+name: WAKE UP REALLY PLEASE
 
 on:
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 jobs:
-  ping-projects:
+  restore:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Проверить, что секрет SUPABASE_PROJECTS_JSON существует
+      - name: Проверить наличие секретов
         run: |
           if [ -z "${{ secrets.SUPABASE_PROJECTS_JSON }}" ]; then
-            echo "❌ Секрет SUPABASE_PROJECTS_JSON не задан."
-            echo "Перейди в Settings → Secrets and variables → Actions и добавь его."
+            echo "❌ SUPABASE_PROJECTS_JSON не задан"
+            exit 1
+          fi
+          if [ -z "${{ secrets.SUPABASE_ACCESS_TOKEN }}" ]; then
+            echo "❌ SUPABASE_ACCESS_TOKEN не задан"
             exit 1
           fi
 
-      - name: Разбудить проекты Supabase
+      - name: Восстановить проекты и убедиться, что ожили
         env:
-          SUPABASE_PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
+          PROJECTS_JSON: ${{ secrets.SUPABASE_PROJECTS_JSON }}
+          ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
-          # Установим jq для парсинга JSON
-          sudo apt-get update -y > /dev/null
-          sudo apt-get install -y jq > /dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
 
-          LENGTH=$(echo "$SUPABASE_PROJECTS_JSON" | jq '. | length')
-          echo "📦 Найдено проектов: $LENGTH"
-
-          if [ "$LENGTH" -eq 0 ]; then
-            echo "⚠️ В SUPABASE_PROJECTS_JSON нет проектов."
-            exit 0
-          fi
+          LENGTH=$(echo "$PROJECTS_JSON" | jq '. | length')
+          echo " Количество проектов: $LENGTH"
 
           for i in $(seq 0 $((LENGTH - 1))); do
-            URL=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].url")
-            KEY=$(echo "$SUPABASE_PROJECTS_JSON" | jq -r ".[$i].anon_key")
-
-            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              echo "⚠️ Пропускаю проект $i — нет url."
-              continue
-            fi
-
-            if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
-              echo "⚠️ Пропускаю $URL — нет anon_key."
-              continue
-            fi
+            REF=$(echo "$PROJECTS_JSON" | jq -r ".[$i].ref")
+            URL=$(echo "$PROJECTS_JSON" | jq -r ".[$i].url")
+            ANON_KEY=$(echo "$PROJECTS_JSON" | jq -r ".[$i].anon_key")
+            SERVICE_KEY=$(echo "$PROJECTS_JSON" | jq -r ".[$i].service_role_key // empty")
 
             echo "=================================="
-            echo "🚀 Проект: $URL"
+            echo " Проект: $REF ($URL)"
 
-            # 1. Health-эндпоинт (auth/v1/health) – показывает, жив ли проект
+            # 1. Быстрая проверка здоровья (вдруг уже жив)
             HEALTH_URL="${URL%/}/auth/v1/health"
-            echo "🌐 Пингую health: $HEALTH_URL"
-
+            echo "   Быстрый health-пинг: $HEALTH_URL"
             set +e
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: $KEY" "$HEALTH_URL")
-            CURL_EXIT=$?
+            HTTP_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 -H "apikey: $ANON_KEY" "$HEALTH_URL")
+            HEALTH_EXIT=$?
             set -e
+            echo "  health exit=$HEALTH_EXIT, http=$HTTP_HEALTH"
 
-            if [ "$CURL_EXIT" -ne 0 ]; then
-              echo "❌ Curl упал с кодом $CURL_EXIT"
-            elif [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "✅ Health OK (HTTP $HTTP_CODE)"
-            else
-              echo "❌ Health ответил не 2xx (HTTP $HTTP_CODE), но проект, скорее всего, разбужен."
+            if [ "$HEALTH_EXIT" -eq 0 ] && [ "$HTTP_HEALTH" -ge 200 ] && [ "$HTTP_HEALTH" -lt 300 ]; then
+              echo "   Проект жив, пропускаем восстановление."
+              continue
             fi
 
-            # 2. REST-эндпоинт (/rest/v1/) – дополнительный пинок для пробуждения БД
-            REST_URL="${URL%/}/rest/v1/"
-            echo "🌐 Пингую REST: $REST_URL"
+            # 2. Вызов Management API на восстановление
+            RESTORE_URL="https://api.supabase.com/v1/projects/${REF}/restore"
+            echo "   Отправляю запрос на восстановление: POST $RESTORE_URL"
 
             set +e
-            HTTP_CODE_REST=$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: $KEY" "$REST_URL")
-            CURL_EXIT_REST=$?
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$RESTORE_URL" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              --connect-timeout 10)
+            RESTORE_EXIT=$?
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
             set -e
 
-            if [ "$CURL_EXIT_REST" -ne 0 ]; then
-              echo "❌ REST curl упал с кодом $CURL_EXIT_REST"
+            if [ "$RESTORE_EXIT" -ne 0 ]; then
+              echo "  ❌ Ошибка сети при вызове API (exit $RESTORE_EXIT)"
+              continue
+            fi
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "  ✅ Восстановление запущено (HTTP $HTTP_CODE). Ответ: $BODY"
+            elif [ "$HTTP_CODE" -eq 429 ]; then
+              echo "  ⚠️ Исчерпан лимит восстановлений. Ответ: $BODY"
+              continue
             else
-              echo "ℹ️ REST ответил HTTP $HTTP_CODE_REST (для пробуждения неважно)"
+              echo "  ❌ Ошибка восстановления (HTTP $HTTP_CODE): $BODY"
+              continue
+            fi
+
+            # 3. Ждём, пока проект поднимется, и проверяем снова
+            echo "   Ожидание 20 секунд для поднятия DNS и сервисов..."
+            sleep 20
+
+            # Проверка через service_role_key (если есть) или анонимный
+            if [ -n "$SERVICE_KEY" ]; then
+              CHECK_KEY="$SERVICE_KEY"
+              CHECK_URL="${URL%/}/rest/v1/"
+              echo "   Проверка через REST (service_role): $CHECK_URL"
+            else
+              CHECK_KEY="$ANON_KEY"
+              CHECK_URL="${URL%/}/auth/v1/health"
+              echo "   Проверка через health (anon): $CHECK_URL"
+            fi
+
+            set +e
+            HTTP_FINAL=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 -H "apikey: $CHECK_KEY" "$CHECK_URL")
+            FINAL_EXIT=$?
+            set -e
+
+            if [ "$FINAL_EXIT" -eq 0 ] && [ "$HTTP_FINAL" -ge 200 ] && [ "$HTTP_FINAL" -lt 300 ]; then
+              echo "   Проект разбужен и отвечает (HTTP $HTTP_FINAL)."
+            else
+              echo "  ⚠️ Проект ещё не отвечает (exit=$FINAL_EXIT, http=$HTTP_FINAL)."
+              echo "  Возможно, нужно больше времени – проверь в Dashboard через пару минут."
             fi
 
             echo "=================================="
           done
+
+          echo "✅ Завершено."
